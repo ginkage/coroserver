@@ -1,3 +1,4 @@
+#include <atomic>
 #include <condition_variable>
 #include <coroutine>
 #include <csignal>
@@ -124,7 +125,7 @@ private:
 struct WorkerSync {
     WorkerSync() : read(std::make_shared<SyncIO>()), write(std::make_shared<SyncIO>()) {}
     std::shared_ptr<SyncIO> read, write;
-    bool error { false };
+    std::atomic<bool> error { false };
 };
 
 void exit_with_error(const std::string &errorMessage)
@@ -267,30 +268,20 @@ private:
 
 struct VoidTask {
     struct promise_type {
-        VoidTask get_return_object() { return VoidTask {}; }
+        VoidTask get_return_object() {
+            return VoidTask{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
         void unhandled_exception() noexcept {}
         void return_void() noexcept {}
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_never final_suspend() noexcept { return {}; }
+        std::suspend_always initial_suspend() noexcept { return {}; }
+        struct FinalAwaitable {
+            bool await_ready() const noexcept { return false; }
+            void await_suspend(std::coroutine_handle<> h) noexcept { h.destroy(); }
+            void await_resume() const noexcept {}
+        };
+        FinalAwaitable final_suspend() noexcept { return {}; }
     };
-};
-
-class ScheduleStart {
-public:
-    ScheduleStart(std::shared_ptr<ThreadPool> pool) : thread_pool(pool) {}
-
-    constexpr bool await_ready() const noexcept {
-        return false;
-    }
-
-    void await_suspend(std::coroutine_handle<> handle) {
-        thread_pool->put_item(handle);
-    }
-
-    constexpr void await_resume() const noexcept {}
-
-private:
-    std::shared_ptr<ThreadPool> thread_pool;
+    std::coroutine_handle<promise_type> handle;
 };
 
 class WaitIO {
@@ -311,9 +302,7 @@ private:
     std::shared_ptr<SyncIO> sync_io;
 };
 
-VoidTask run_worker(std::shared_ptr<TrackerSync> ts, std::shared_ptr<ThreadPool> thread_pool, int fd) {
-    co_await ScheduleStart(thread_pool);
-
+VoidTask run_worker(std::shared_ptr<TrackerSync> ts, int fd) {
     std::shared_ptr<WorkerSync> socket_ws = ts->get();
 
     //log("------ Accepted new connection ------");
@@ -378,8 +367,6 @@ VoidTask run_worker(std::shared_ptr<TrackerSync> ts, std::shared_ptr<ThreadPool>
 }
 
 VoidTask run_server(std::shared_ptr<EpollTracker> tracker, std::shared_ptr<ThreadPool> thread_pool, std::shared_ptr<SyncWait> quit_sync) {
-    co_await ScheduleStart(thread_pool);
-
     // Start server
     int in_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (in_socket < 0)
@@ -424,7 +411,7 @@ VoidTask run_server(std::shared_ptr<EpollTracker> tracker, std::shared_ptr<Threa
             log(ss.str());
         }
         else
-            run_worker(std::make_shared<TrackerSync>(tracker, new_socket), thread_pool, new_socket);
+            thread_pool->put_item(run_worker(std::make_shared<TrackerSync>(tracker, new_socket), new_socket).handle);
     }
 
     quit_sync->resume();
@@ -439,7 +426,7 @@ int main() {
     std::shared_ptr<EpollTracker> tracker = std::make_shared<EpollTracker>(thread_pool);
     std::shared_ptr<SyncWait> quit_sync = std::make_shared<SyncWait>();
 
-    run_server(tracker, thread_pool, quit_sync);
+    thread_pool->put_item(run_server(tracker, thread_pool, quit_sync).handle);
 
     quit_sync->wait();
 
